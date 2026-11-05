@@ -1,0 +1,107 @@
+#cloud-config
+# Vendor data: merged on top of the Proxmox-generated user-data, so the
+# native user, keys, IP and hostname from `initialization` keep working.
+# Runs on the FIRST boot only — a changed snippet does not reach an existing VM.
+
+# A new instance-id (any `initialization` change) would otherwise regenerate
+# the SSH host keys and break known_hosts.
+ssh_deletekeys: false
+
+packages:
+  - qemu-guest-agent
+  # GTX 770M (Kepler): nouveau in the kernel + Mesa userspace —
+  # NVK for Vulkan (what Horizon's wgpu uses), nouveau GL as a bonus.
+  # The proprietary 470 branch (last one for Kepler) is not packaged for resolute.
+  - mesa-vulkan-drivers
+  - libgl1-mesa-dri
+  - vulkan-tools
+  - mesa-utils
+  - mesa-utils-bin
+  # Xorg on the laptop panel (modesetting on the 770M) + a tiling WM that grids bot windows.
+  - xserver-xorg-core
+  - xserver-xorg-input-libinput
+  - xinit
+  - awesome
+  - x11-xserver-utils
+  - fbset
+  # horizon-client is hard-linked against ALSA even though bots need no sound.
+  - libasound2t64
+  # Agent tooling.
+  - tmux
+  - git
+  - rsync
+  - jq
+  - python3
+
+write_files:
+  # X only on the passed-through GPU (guest bus 01:00.0), never on the emulated VGA (bochs).
+  - path: /etc/X11/xorg.conf.d/10-gpu.conf
+    permissions: "0644"
+    content: |
+      Section "Device"
+        Identifier "gpu"
+        Driver     "modesetting"
+        BusID      "PCI:1:0:0"
+      EndSection
+  # Lets a systemd service (not a console login) start Xorg on a VT.
+  - path: /etc/X11/Xwrapper.config
+    permissions: "0644"
+    content: |
+      allowed_users=anybody
+      needs_root_rights=yes
+  # Xorg + awesome on the panel. A system unit, not a user one: Xorg needs a VT.
+  - path: /etc/systemd/system/bots-x.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Xorg + awesome on the GPU panel for Horizon bots
+      After=systemd-user-sessions.service
+      Conflicts=getty@tty1.service
+
+      [Service]
+      User=${username}
+      Environment=HOME=/home/${username}
+      ExecStart=/usr/bin/xinit /usr/bin/awesome -- :0 vt1 -keeptty -nolisten tcp
+      Restart=on-failure
+      RestartSec=3
+
+      [Install]
+      WantedBy=multi-user.target
+  # awesome: one tag, "fair" layout — every new bot window re-grids the screen.
+  # Deferred: written after the user exists, so the owner resolves.
+  - path: /home/${username}/.config/awesome/rc.lua
+    owner: ${username}:${username}
+    permissions: "0644"
+    defer: true
+    content: |
+      local awful     = require("awful")
+      local beautiful = require("beautiful")
+      local gears     = require("gears")
+      require("awful.autofocus")
+      beautiful.init(gears.filesystem.get_themes_dir() .. "default/theme.lua")
+
+      awful.layout.layouts = { awful.layout.suit.fair }
+      awful.screen.connect_for_each_screen(function(s)
+        awful.tag({ "bots" }, s, awful.layout.suit.fair)
+      end)
+
+      awful.rules.rules = {
+        { rule = {}, properties = {
+            border_width     = 1,
+            size_hints_honor = false,
+            focus            = false,
+        } },
+      }
+
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  # GPU device nodes: /dev/dri/card1 is video, renderD128 is render.
+  - usermod -aG video,render ${username}
+  # horizon-server runs as a user service — it must live without an SSH session.
+  - loginctl enable-linger ${username}
+  - systemctl daemon-reload
+  - systemctl enable --now bots-x.service
+  # Tailscale is only installed here; it is joined by hand with the tag (see README) —
+  # an auth key in a snippet would sit in plain text on the node.
+  - curl -fsSL https://tailscale.com/install.sh | sh
+  - runuser -l ${username} -c 'curl -fsSL https://claude.ai/install.sh | bash'
